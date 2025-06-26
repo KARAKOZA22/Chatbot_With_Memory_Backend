@@ -239,7 +239,7 @@ class NotebookChatAssistant:
         self.groq_api_key = groq_api
         self.chutes_api_key = chutes_api
         self.groq_client = Groq(api_key=groq_api)
-        self.groq_model = "llama-3.1-70b-versatile"
+        self.groq_model = "llama-3.3-70b-versatile"
         self.chutes_model = "chutesai/Mistral-Small-3.1-24B-Instruct-2503"
         self.memory_store: Union[NotebookMemoryStore, None] = None
         logging.info("✅ NotebookChatAssistant initialized!")
