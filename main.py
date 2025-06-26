@@ -173,64 +173,19 @@ class NotebookMemoryStore:
         return loaded_chats
 
 
-    def get_context_messages(self, current_chat_id: str) -> List[Dict[str, str]]:
-        """Get messages for LLM context, filtered by current_chat_id."""
+    def get_context_messages(self) -> List[Dict[str, str]]:
+        """Get all messages for LLM context from the entire history."""
         try:
-            logging.info(f"🔄 Building context messages for LLM for chat_id: {current_chat_id}...")
+            logging.info("🔄 Building context messages for LLM from all available history (no chat_id filtering)...")
             
-            # Filter all persisted messages by the current chat_id
-            all_messages_for_chat = [
-                msg for msg in self.get_all_messages_sorted()
-                if msg.get("chat_id") == current_chat_id
-            ]
+            # Get all messages from the database, which are already sorted by timestamp
+            all_persisted_messages = self.get_all_messages_sorted()
 
             context_messages = []
             message_type_counts = {"user": 0, "assistant": 0, "summary": 0}
 
-            # Qdrant cleanup only considers the *total* messages in the collection, not per chat session.
-            # So, for context, we need to potentially summarize/limit messages within this specific chat's history
-            # if they exceed a certain length, which the current `cleanup_memory` doesn't do per-chat.
-            # For simplicity, we'll return all relevant messages for the current chat, up to a reasonable limit.
-            # The existing `cleanup_memory` still operates globally on the Qdrant collection.
-
-            # We need to apply logic similar to `cleanup_memory` but specifically for context messages
-            # if we want to limit the LLM context size *per chat*.
-            # For now, let's assume `get_all_messages_sorted()` for the specific chat is sufficient
-            # and that the global `cleanup_memory` keeps overall collection size in check.
-
-            # The current cleanup_memory logic relies on the chat_assistant being linked.
-            # It also performs summarization based on *all* messages, not specific chat segments.
-            # If we need *per-chat* context summarization, that would be a more significant change.
-            # For this request, we'll just pull the messages for the current chat.
-
-            # Re-read messages from Qdrant for this specific chat, sorted by timestamp
-            # This is more robust than relying on st.session_state which might not be up-to-date
-            # with Qdrant after a cleanup if not handled carefully.
-            q = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="chat_id",
-                        match=models.MatchValue(value=current_chat_id)
-                    )
-                ]
-            )
-            chat_specific_results, _ = self.client.scroll(
-                collection_name=self.collection_name,
-                scroll_filter=q,
-                limit=self.max_total_messages + 10, # Fetch a bit more than max_total_messages to be safe
-                with_payload=True,
-                with_vectors=False,
-            )
-            
-            # Sort messages by timestamp
-            chat_messages = []
-            for r in chat_specific_results:
-                if r.payload and "timestamp" in r.payload:
-                    chat_messages.append(r.payload)
-            chat_messages.sort(key=lambda x: x["timestamp"])
-
-
-            for msg in chat_messages:
+            for msg in all_persisted_messages:
+                # Ensure we only include user/assistant/summary types for LLM context
                 if msg['message_type'] == 'user':
                     context_messages.append({"role": "user", "content": msg['message']})
                     message_type_counts["user"] += 1
@@ -241,13 +196,13 @@ class NotebookMemoryStore:
                     context_messages.append({"role": "system", "content": f"Previous context: {msg['message']}"})
                     message_type_counts["summary"] += 1
 
-            logging.info(f"📋 Context built for chat_id {current_chat_id}: {len(context_messages)} total messages")
+            logging.info(f"📋 Context built: {len(context_messages)} total messages")
             logging.info(f"   └─ User: {message_type_counts['user']}, Assistant: {message_type_counts['assistant']}, Summaries: {message_type_counts['summary']}")
 
             return context_messages
 
         except Exception as e:
-            logging.error(f"Failed to build context for chat_id {current_chat_id}: {str(e)}")
+            logging.error(f"Failed to build context: {str(e)}")
             return []
 
 
@@ -430,14 +385,14 @@ class NotebookChatAssistant:
         logging.info(f"✅ Chutes stream complete! Generated {len(response_text)} characters from {chunk_count} chunks")
         return response_text
 
-    def generate_response(self, message: str, current_chat_id: str) -> str:
-        logging.info(f"🎭 Generating response for message: '{message[:50]}...' for chat_id: {current_chat_id}")
+    def generate_response(self, message: str) -> str: # Removed current_chat_id parameter
+        logging.info(f"🎭 Generating response for message: '{message[:50]}...'")
         if not self.memory_store:
             logging.error("Memory store not set for ChatAssistant. Cannot generate response.")
             return "Error: Chatbot memory is not initialized."
         try:
-            # Pass current_chat_id to get_context_messages
-            context_messages = self.memory_store.get_context_messages(current_chat_id)
+            # No longer pass current_chat_id to get_context_messages
+            context_messages = self.memory_store.get_context_messages()
             messages = [{"role": "system", "content": "You are a helpful assistant with access to conversation history. Keep your responses concise and to the point."}]
             messages.extend(context_messages)
             messages.append({"role": "user", "content": message})
@@ -614,14 +569,30 @@ if st.session_state.current_chat:
 
     # Reload messages for the current chat from Qdrant to ensure consistency
     # This is important after cleanup or if other changes happened to the store
-    persisted_messages_for_current_chat = memory_store.get_context_messages(st.session_state.current_chat)
+    # This now gets ALL messages for the context, not just the current chat's
+    persisted_messages_for_current_chat = memory_store.get_context_messages()
     
     # Update current_chat["messages"] to reflect the persisted state
+    # This part needs to be careful if we truly want to show only messages related to the selected UI chat_id.
+    # The get_context_messages is now global, but the UI might still want to show a single chat.
+    # To correctly display *only* the current chat's messages in the UI, even if LLM context is global,
+    # we should filter `persisted_messages_for_current_chat` by `st.session_state.current_chat`
+    # for display purposes only.
+    # However, the user's initial request was "get all the data that is stored in the data base thats it dont filter by the key or chat id cuz only one user will be reacting with the chatbot"
+    # This implies that perhaps the concept of separate "chats" in the UI is less important,
+    # or that the user wants the display to also reflect the combined history.
+    # For now, I'll update current_chat["messages"] with only the messages
+    # that belong to the `st.session_state.current_chat` to maintain the multi-chat UI feature
+    # while providing global context to the LLM. This is a common pattern.
+
+    # Filter messages for display in the current UI chat window
+    displayed_messages = [
+        msg_data for msg_data in persisted_messages_for_current_chat
+        if msg_data.get("chat_id") == st.session_state.current_chat # Filter for UI display
+    ]
+
     current_chat["messages"] = []
-    for msg_data in persisted_messages_for_current_chat:
-        # Note: get_context_messages returns LLM-formatted dicts,
-        # but st.chat_message expects "role" and "content"
-        # Extract content, but ensure we don't accidentally display 'system' messages in chat UI
+    for msg_data in displayed_messages:
         if msg_data["role"] in ["user", "assistant"]:
             current_chat["messages"].append({
                 "role": msg_data["role"],
@@ -633,7 +604,6 @@ if st.session_state.current_chat:
             st.markdown(msg["content"])
 
     if prompt := st.chat_input("Type your message..."):
-        # Add user message to the current chat in session state
         current_chat["messages"].append({"role": "user", "content": prompt})
 
         with st.chat_message("user"):
@@ -643,7 +613,7 @@ if st.session_state.current_chat:
             with st.spinner("Thinking..."):
                 try:
                     # Pass current_chat_id to generate_response
-                    assistant_reply = chat_assistant.generate_response(prompt, st.session_state.current_chat)
+                    assistant_reply = chat_assistant.generate_response(prompt) # Removed current_chat_id from arguments
 
                     # Store messages in Qdrant via memory_store, including the current_chat_id
                     memory_store.store_message(prompt, message_type="user", chat_id=st.session_state.current_chat)
@@ -658,12 +628,7 @@ if st.session_state.current_chat:
                     assistant_reply = "Sorry, I encountered an error while processing your request."
                     st.markdown(assistant_reply)
 
-        # Add assistant message to the current chat in session state
         current_chat["messages"].append({"role": "assistant", "content": assistant_reply})
         st.rerun() # Rerun to display the newly added messages
 else:
-    # If no chat is current (e.g., after deleting the last one), inform the user
     st.info("A chat session is being set up automatically, or you can select an existing one from the sidebar if available.")
-    # If there are no chats at all, a new one would have been created and rerun would occur.
-    # This block mostly handles the brief moment between deletion and new chat creation.
-
