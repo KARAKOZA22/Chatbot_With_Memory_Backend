@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", category=UserWarning, module='sentence_transfo
 
 # --- Libraries for backend logic (now integrated) ---
 try:
+    import asyncio
     from qdrant_client import QdrantClient, models
     from sentence_transformers import SentenceTransformer
     from groq import Groq
