@@ -38,7 +38,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 st.set_page_config(page_title="Chatbot That Can Remember", layout="wide")
-st.title("My Persistent Chatbot")
+st.title("CRAYON CHATBOT")
 
 # --- NotebookMemoryStore Class (Backend Logic) ---
 class NotebookMemoryStore:
@@ -355,12 +355,12 @@ if "messages" not in st.session_state:
 # Sidebar for chat controls
 with st.sidebar:
     st.header("Chat Controls")
-    if st.button("🗑️ Clear Full History", use_container_width=True, type="primary"):
+    if st.button("New Chat", use_container_width=True, type="primary"):
         # Clear the backend Qdrant history
         memory_store.clear_all_history()
         # Reset the frontend session state message list
         st.session_state.messages = []
-        st.success("Chat history has been cleared!")
+        st.success("Chat history has been cleared and new one is created")
         time.sleep(1) # Give user time to see the message
         st.rerun()
 
