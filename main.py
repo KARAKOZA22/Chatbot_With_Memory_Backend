@@ -5,7 +5,7 @@ import time
 import logging
 import warnings
 from datetime import datetime
-from typing import List, Dict, Union, Any
+from typing import List, Dict, Union
 
 # --- Suppress warnings from sentence-transformers for cleaner logs during startup ---
 warnings.filterwarnings("ignore", category=UserWarning, module='sentence_transformers')
@@ -32,6 +32,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+# Optionally, suppress noisy logs from underlying libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
@@ -81,25 +82,20 @@ class NotebookMemoryStore:
         except Exception as e:
             logging.error(f"Failed to ensure collection: {str(e)}")
             st.error(f"Failed to connect to Qdrant or create collection: {str(e)}. Please check your Qdrant URL and API key.")
-            st.stop() # Stop the app if Qdrant isn't ready
+            st.stop()
 
-    def store_message(self, message: str, message_type: str = "user", chat_id: str = None):
-        logging.info(f"💾 Storing {message_type} message (length: {len(message)} chars) for chat_id: {chat_id}")
-        if chat_id is None:
-            logging.warning("Attempted to store message without a chat_id. This message will not be associated with a session.")
-            return False # Or raise an error, depending on desired strictness
-
+    def store_message(self, message: str, message_type: str = "user"):
+        logging.info(f"💾 Storing {message_type} message (length: {len(message)} chars)")
         try:
             embedding = self.embedding_model.encode(message).tolist()
-            message_uuid = str(uuid.uuid4()) # Use a unique ID for each message point
+            message_id = str(uuid.uuid4())
             payload = {
                 "message": message,
                 "message_type": message_type,
                 "timestamp": datetime.now().isoformat(),
-                "message_id": message_uuid,
-                "chat_id": chat_id # Store the chat ID
+                "message_id": message_id
             }
-            point = models.PointStruct(id=message_uuid, vector=embedding, payload=payload)
+            point = models.PointStruct(id=message_id, vector=embedding, payload=payload)
             self.client.upsert(collection_name=self.collection_name, wait=True, points=[point])
             logging.info(f"✅ {message_type.capitalize()} message stored successfully!")
             return True
@@ -116,119 +112,61 @@ class NotebookMemoryStore:
             return 0
 
     def get_all_messages_sorted(self):
-        """Get all messages sorted by timestamp across all chats"""
         try:
             results, _ = self.client.scroll(
                 collection_name=self.collection_name,
-                limit=10000, # Max limit, adjust if you expect more messages
+                limit=10000,
                 with_payload=True,
                 with_vectors=False,
             )
             messages = []
             for r in results:
                 if hasattr(r, 'payload') and r.payload:
-                    if "message" in r.payload and "timestamp" in r.payload and "chat_id" in r.payload:
+                    if "message" in r.payload and "timestamp" in r.payload:
                         messages.append(r.payload)
             messages.sort(key=lambda x: x["timestamp"])
-            logging.debug(f"Retrieved and sorted {len(messages)} messages from all chats.")
+            logging.debug(f"Retrieved and sorted {len(messages)} messages")
             return messages
         except Exception as e:
-            logging.error(f"Failed to fetch all messages: {str(e)}")
+            logging.error(f"Failed to fetch messages: {str(e)}")
             return []
 
-    def load_all_chats(self) -> Dict[str, Dict[str, Any]]:
-        """Loads all chat history from Qdrant, grouped by chat_id."""
-        logging.info("⏳ Loading all chat history from Qdrant...")
-        all_persisted_messages = self.get_all_messages_sorted()
-
-        loaded_chats: Dict[str, Dict[str, Any]] = {}
-        for msg_payload in all_persisted_messages:
-            chat_id = msg_payload.get("chat_id")
-            if not chat_id:
-                logging.warning(f"Skipping message due to missing chat_id: {msg_payload.get('message_id')}")
-                continue
-
-            if chat_id not in loaded_chats:
-                # Initialize chat with a default title for now, will refine later
-                loaded_chats[chat_id] = {
-                    "title": f"Chat {datetime.fromisoformat(msg_payload['timestamp']).strftime('%Y-%m-%d')}",
-                    "messages": []
-                }
-            loaded_chats[chat_id]["messages"].append({
-                "role": msg_payload["message_type"],
-                "content": msg_payload["message"]
-            })
-
-            # Update the chat title to reflect the date of the first message
-            # The list is sorted, so the first message added for a chat_id is the earliest
-            if len(loaded_chats[chat_id]["messages"]) == 1:
-                first_message_time = datetime.fromisoformat(msg_payload['timestamp'])
-                loaded_chats[chat_id]["title"] = f"Chat {first_message_time.strftime('%Y-%m-%d')}"
-            else:
-                # If a more precise title is desired (e.g., using the *earliest* message from the group),
-                # this logic could be enhanced. For simplicity, we just use the first message's date.
-                pass # Title is already set by the first message for this chat_id
-
-        logging.info(f"✅ Loaded {len(loaded_chats)} chat sessions from Qdrant.")
-        return loaded_chats
-
-
-    def get_context_messages(self) -> List[Dict[str, str]]:
-        """Get all messages for LLM context from the entire history."""
+    def get_context_messages(self):
         try:
-            logging.info("🔄 Building context messages for LLM from all available history (no chat_id filtering)...")
-            
-            # Get all messages from the database, which are already sorted by timestamp
-            all_persisted_messages = self.get_all_messages_sorted()
-
+            logging.info("🔄 Building context messages for LLM...")
+            all_messages = self.get_all_messages_sorted()
             context_messages = []
-            message_type_counts = {"user": 0, "assistant": 0, "summary": 0}
-
-            for msg in all_persisted_messages:
-                # Ensure we only include user/assistant/summary types for LLM context
+            for msg in all_messages:
                 if msg['message_type'] == 'user':
                     context_messages.append({"role": "user", "content": msg['message']})
-                    message_type_counts["user"] += 1
                 elif msg['message_type'] == 'assistant':
                     context_messages.append({"role": "assistant", "content": msg['message']})
-                    message_type_counts["assistant"] += 1
                 elif msg['message_type'] == 'summary':
                     context_messages.append({"role": "system", "content": f"Previous context: {msg['message']}"})
-                    message_type_counts["summary"] += 1
-
             logging.info(f"📋 Context built: {len(context_messages)} total messages")
-            logging.info(f"   └─ User: {message_type_counts['user']}, Assistant: {message_type_counts['assistant']}, Summaries: {message_type_counts['summary']}")
-
             return context_messages
-
         except Exception as e:
             logging.error(f"Failed to build context: {str(e)}")
             return []
 
-
     def cleanup_memory(self):
-        """Clean up memory when we exceed max_total_messages (this is a global cleanup)"""
         try:
             message_count = self.get_message_count()
-            logging.info(f"🧹 Global Memory cleanup check: {message_count}/{self.max_total_messages} messages")
+            logging.info(f"🧹 Memory cleanup check: {message_count}/{self.max_total_messages} messages")
 
             if message_count <= self.max_total_messages:
-                logging.info("✅ No global cleanup needed - under message limit")
+                logging.info("✅ No cleanup needed - under message limit")
                 return
 
-            logging.warning(f"⚠️  Global Memory cleanup required! Current: {message_count}, Max: {self.max_total_messages}")
-
-            all_messages = self.get_all_messages_sorted() # Gets ALL messages across all chats
-
-            # Separate message types
+            logging.warning(f"⚠️  Memory cleanup required! Current: {message_count}, Max: {self.max_total_messages}")
+            all_messages = self.get_all_messages_sorted()
             regular_messages = [m for m in all_messages if m['message_type'] in ['user', 'assistant']]
             summaries = [m for m in all_messages if m['message_type'] == 'summary']
 
-            logging.info(f"📊 Message breakdown (global): {len(regular_messages)} regular, {len(summaries)} summaries")
+            logging.info(f"📊 Message breakdown: {len(regular_messages)} regular, {len(summaries)} summaries")
 
-            # Step 1: Handle regular message overflow by summarizing oldest messages
             if len(regular_messages) > self.max_regular:
-                logging.info(f"🔄 Step 1: Processing global regular message overflow. Need to summarize oldest {len(regular_messages) - self.max_regular} messages.")
+                logging.info(f"🔄 Step 1: Processing regular message overflow. Need to summarize oldest {len(regular_messages) - self.max_regular} messages.")
                 messages_to_summarize_count = len(regular_messages) - self.max_regular
                 messages_to_process = regular_messages[:messages_to_summarize_count]
 
@@ -245,12 +183,12 @@ class NotebookMemoryStore:
                     self.delete_messages_by_ids(ids_to_delete)
 
                     logging.info("💾 Storing new summary...")
-                    self.store_message(summary_text, message_type="summary", chat_id="global_summary") # Use a special chat_id for global summaries
+                    self.store_message(summary_text, message_type="summary")
                     logging.info(f"✅ Step 1 complete: Summarized and removed {len(ids_to_delete)} regular messages")
 
-            updated_summaries = self.get_summaries() # Get global summaries
+            updated_summaries = self.get_summaries()
             if len(updated_summaries) > self.max_summaries:
-                logging.warning(f"🔄 Step 2: Too many global summaries ({len(updated_summaries)}/{self.max_summaries}), creating meta-summary...")
+                logging.warning(f"🔄 Step 2: Too many summaries ({len(updated_summaries)}/{self.max_summaries}), creating meta-summary...")
                 if not hasattr(self, 'create_meta_summary') or not callable(self.create_meta_summary):
                     logging.error("Meta-summary function 'create_meta_summary' not linked to MemoryStore. Cannot meta-summarize.")
                     return
@@ -262,20 +200,19 @@ class NotebookMemoryStore:
                 self.delete_messages_by_ids(summary_ids_to_delete)
 
                 logging.info("💾 Storing meta-summary...")
-                self.store_message(meta_summary_text, message_type="summary", chat_id="global_summary") # Use a special chat_id for global summaries
+                self.store_message(meta_summary_text, message_type="summary")
                 logging.info(f"✅ Step 2 complete: Created meta-summary from {len(updated_summaries)} summaries")
 
             final_count = self.get_message_count()
-            logging.info(f"🎉 Global cleanup complete! Messages now: {final_count}")
+            logging.info(f"🎉 Cleanup complete! Messages now: {final_count}")
 
         except Exception as e:
             logging.error(f"Memory cleanup failed: {str(e)}")
 
     def get_summaries(self):
-        """Get all summary messages (potentially filtered by chat_id if needed, currently global)"""
         try:
             logging.debug("📚 Fetching all summaries...")
-            all_messages = self.get_all_messages_sorted() # This already returns messages with chat_id
+            all_messages = self.get_all_messages_sorted()
             summaries = [m for m in all_messages if m['message_type'] == 'summary']
             logging.debug(f"Found {len(summaries)} summaries")
             return summaries
@@ -298,6 +235,23 @@ class NotebookMemoryStore:
             logging.info(f"✅ Successfully deleted {len(message_ids)} messages")
         except Exception as e:
             logging.error(f"Failed to delete messages: {str(e)}")
+    
+    def clear_all_history(self):
+        """Deletes all points from the collection to clear the history."""
+        try:
+            logging.warning(f"🗑️  CLEARING ALL HISTORY from collection '{self.collection_name}'...")
+            all_messages = self.get_all_messages_sorted()
+            if not all_messages:
+                logging.info("✅ History is already empty. No action taken.")
+                return
+            
+            ids_to_delete = [msg['message_id'] for msg in all_messages]
+            self.delete_messages_by_ids(ids_to_delete)
+            logging.info("✅✅ ALL CHAT HISTORY HAS BEEN CLEARED from Qdrant.")
+        except Exception as e:
+            logging.error(f"Failed to clear all history: {str(e)}")
+            st.error("Could not clear chat history.")
+
 
 # --- NotebookChatAssistant Class (Backend Logic) ---
 class NotebookChatAssistant:
@@ -385,13 +339,12 @@ class NotebookChatAssistant:
         logging.info(f"✅ Chutes stream complete! Generated {len(response_text)} characters from {chunk_count} chunks")
         return response_text
 
-    def generate_response(self, message: str) -> str: # Removed current_chat_id parameter
+    def generate_response(self, message: str) -> str:
         logging.info(f"🎭 Generating response for message: '{message[:50]}...'")
         if not self.memory_store:
             logging.error("Memory store not set for ChatAssistant. Cannot generate response.")
             return "Error: Chatbot memory is not initialized."
         try:
-            # No longer pass current_chat_id to get_context_messages
             context_messages = self.memory_store.get_context_messages()
             messages = [{"role": "system", "content": "You are a helpful assistant with access to conversation history. Keep your responses concise and to the point."}]
             messages.extend(context_messages)
@@ -416,8 +369,7 @@ class NotebookChatAssistant:
         try:
             formatted = "\n".join([f"{m['message_type'].capitalize()}: {m['message']}" for m in messages])
             system_prompt = """Summarize the following conversation segment concisely.
-            Focus on key information, decisions, and context that should be remembered.
-            The summary should be no longer than 150 words."""
+            Focus on key information, decisions, and context that should be remembered."""
             summary_input = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": formatted}
@@ -439,8 +391,7 @@ class NotebookChatAssistant:
         try:
             formatted = "\n".join([f"Previous summary: {s['message']}" for s in summaries])
             system_prompt = """Create a compressed master summary from these previous summaries.
-            Extract and combine the most important information, themes, and context.
-            The meta-summary should be no longer than 200 words."""
+            Extract and combine the most important information, themes, and context."""
             summary_input = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": formatted}
@@ -485,119 +436,76 @@ if "memory_store" not in st.session_state:
         logging.info("🎉 Chatbot components initialized and stored in session state!")
     except Exception as e:
         st.error(f"Error initializing chatbot components. Please check your `secrets.toml` and internet connection: {e}")
-        st.stop() # Stop the app if initialization fails
+        st.stop()
 
 # Access initialized components
 memory_store = st.session_state.memory_store
 chat_assistant = st.session_state.chat_assistant
 
 
-# Initialize session state for chats management and load from Qdrant
+# Initialize session state for chats management
+# This block is now designed to load history from Qdrant on first run
 if "chats" not in st.session_state:
-    st.session_state.chats = memory_store.load_all_chats()
-    logging.info(f"Loaded {len(st.session_state.chats)} chats from Qdrant during startup.")
+    logging.info("🚀 First run in this session. Attempting to load chat history from Qdrant.")
+    st.session_state.chats = {}
+    st.session_state.current_chat = None
 
-    # If no chats were loaded, create a new one
-    if not st.session_state.chats:
+    all_messages_from_db = memory_store.get_all_messages_sorted()
+
+    if all_messages_from_db:
+        logging.info(f"✅ Found {len(all_messages_from_db)} messages in DB. Rebuilding chat UI.")
+        # Create a single chat session to hold the entire restored history.
+        chat_id = "restored_chat_session"
+        title = "Restored Chat History"
+        st.session_state.chats[chat_id] = {"title": title, "messages": []}
+
+        # Populate the messages for the UI, skipping system messages/summaries
+        for msg in all_messages_from_db:
+            role = msg.get('message_type') # 'user' or 'assistant'
+            content = msg.get('message', '')
+            if role in ['user', 'assistant']:
+                st.session_state.chats[chat_id]["messages"].append({"role": role, "content": content})
+        
+        st.session_state.current_chat = chat_id
+        logging.info(f"✅ Restored {len(st.session_state.chats[chat_id]['messages'])} messages to the UI.")
+
+    else:
+        # If the DB is empty, create a new, fresh chat session.
+        logging.info("✅ No messages found in DB. Creating a new chat session.")
         chat_id = str(uuid.uuid4())
-        title = f"Chat {datetime.now().strftime('%Y-%m-%d')}" # Initial title is just the date
+        title = f"Chat {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         st.session_state.chats[chat_id] = {"title": title, "messages": []}
         st.session_state.current_chat = chat_id
-        logging.info(f"Created new initial chat: {chat_id}")
-    else:
-        # If chats were loaded, select the most recent one
-        # Sort by the datetime in the title or by the internal timestamp of the first message if available
-        most_recent_chat_id = sorted(
-            st.session_state.chats.keys(),
-            key=lambda cid: datetime.strptime(st.session_state.chats[cid]["title"].replace("Chat ", ""), '%Y-%m-%d') if "Chat " in st.session_state.chats[cid]["title"] else datetime.min,
-            reverse=True
-        )[0]
-        st.session_state.current_chat = most_recent_chat_id
-        logging.info(f"Selected most recent loaded chat: {most_recent_chat_id}")
-    st.rerun() # Rerun to display the loaded/selected chat
-
 
 # Sidebar for chat management
 with st.sidebar:
-    st.header("Your Chats")
+    st.header("Chat Controls")
+
+    if st.button("New Chat", use_container_width=True):
+        # Clear the backend Qdrant history
+        memory_store.clear_all_history()
+        
+        # Reset the frontend session state
+        chat_id = str(uuid.uuid4())
+        title = f"New Chat {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        st.session_state.chats = {chat_id: {"title": title, "messages": []}}
+        st.session_state.current_chat = chat_id
+        st.rerun()
 
     st.markdown("---")
-
-    if st.session_state.chats:
-        # Sort chats by date for display
-        sorted_chat_ids = sorted(
-            st.session_state.chats.keys(),
-            key=lambda cid: datetime.strptime(st.session_state.chats[cid]["title"].replace("Chat ", ""), '%Y-%m-%d') if "Chat " in st.session_state.chats[cid]["title"] else datetime.min,
-            reverse=True
-        )
-        for chat_id in sorted_chat_ids:
-            col1, col2 = st.columns([0.8, 0.2])
-            with col1:
-                if st.button(
-                    st.session_state.chats[chat_id]["title"],
-                    key=f"select_{chat_id}",
-                    use_container_width=True,
-                    type="primary" if chat_id == st.session_state.current_chat else "secondary"
-                ):
-                    st.session_state.current_chat = chat_id
-                    st.rerun()
-            with col2:
-                if st.button("🗑️", key=f"delete_{chat_id}"):
-                    # Delete messages associated with this chat_id from Qdrant
-                    messages_to_delete_qdrant_ids = [
-                        msg_payload["message_id"] for msg_payload in memory_store.get_all_messages_sorted()
-                        if msg_payload.get("chat_id") == chat_id
-                    ]
-                    if messages_to_delete_qdrant_ids:
-                        memory_store.delete_messages_by_ids(messages_to_delete_qdrant_ids)
-                        logging.info(f"Deleted {len(messages_to_delete_qdrant_ids)} messages from Qdrant for chat {chat_id}.")
-
-                    # Remove chat from session state
-                    if chat_id == st.session_state.current_chat:
-                        st.session_state.current_chat = None
-                    del st.session_state.chats[chat_id]
-                    logging.info(f"Deleted chat {chat_id} from session state.")
-                    st.rerun()
+    
+    # Since we now manage one persistent history, the multi-chat display is simplified.
+    # If you want multi-chat, this section would need significant rework.
+    if st.session_state.chats and st.session_state.current_chat:
+         st.write(f"**Current Session:**")
+         st.write(st.session_state.chats[st.session_state.current_chat]["title"])
     else:
-        st.write("No chats available. Start typing to create a new one automatically!")
-
+        st.write("No active chat.")
 
 # Main chat display area
-if st.session_state.current_chat:
+if st.session_state.current_chat and st.session_state.current_chat in st.session_state.chats:
     current_chat = st.session_state.chats[st.session_state.current_chat]
     st.header(current_chat["title"])
-
-    # Reload messages for the current chat from Qdrant to ensure consistency
-    # This is important after cleanup or if other changes happened to the store
-    # This now gets ALL messages for the context, not just the current chat's
-    persisted_messages_for_current_chat = memory_store.get_context_messages()
-    
-    # Update current_chat["messages"] to reflect the persisted state
-    # This part needs to be careful if we truly want to show only messages related to the selected UI chat_id.
-    # The get_context_messages is now global, but the UI might still want to show a single chat.
-    # To correctly display *only* the current chat's messages in the UI, even if LLM context is global,
-    # we should filter `persisted_messages_for_current_chat` by `st.session_state.current_chat`
-    # for display purposes only.
-    # However, the user's initial request was "get all the data that is stored in the data base thats it dont filter by the key or chat id cuz only one user will be reacting with the chatbot"
-    # This implies that perhaps the concept of separate "chats" in the UI is less important,
-    # or that the user wants the display to also reflect the combined history.
-    # For now, I'll update current_chat["messages"] with only the messages
-    # that belong to the `st.session_state.current_chat` to maintain the multi-chat UI feature
-    # while providing global context to the LLM. This is a common pattern.
-
-    # Filter messages for display in the current UI chat window
-    displayed_messages = [
-        msg_data for msg_data in persisted_messages_for_current_chat
-        if msg_data.get("chat_id") == st.session_state.current_chat # Filter for UI display
-    ]
-
-    current_chat["messages"] = []
-    for msg_data in displayed_messages:
-        if msg_data["role"] in ["user", "assistant"]:
-            current_chat["messages"].append({
-                "role": msg_data["role"],
-                "content": msg_data["content"]
-            })
 
     for msg in current_chat["messages"]:
         with st.chat_message(msg["role"]):
@@ -612,23 +520,26 @@ if st.session_state.current_chat:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Pass current_chat_id to generate_response
-                    assistant_reply = chat_assistant.generate_response(prompt) # Removed current_chat_id from arguments
+                    # Store user message BEFORE generating response
+                    memory_store.store_message(prompt, message_type="user")
 
-                    # Store messages in Qdrant via memory_store, including the current_chat_id
-                    memory_store.store_message(prompt, message_type="user", chat_id=st.session_state.current_chat)
-                    memory_store.store_message(assistant_reply, message_type="assistant", chat_id=st.session_state.current_chat)
+                    # Generate response based on the now-updated history
+                    assistant_reply = chat_assistant.generate_response(prompt)
 
-                    # Perform global memory cleanup
+                    # Store assistant response
+                    memory_store.store_message(assistant_reply, message_type="assistant")
+
+                    # Perform memory cleanup if necessary
                     memory_store.cleanup_memory()
 
                     st.markdown(assistant_reply)
                 except Exception as e:
+                    logging.error(f"Fatal error in chat loop: {e}")
                     st.error(f"An error occurred during response generation: {e}")
                     assistant_reply = "Sorry, I encountered an error while processing your request."
                     st.markdown(assistant_reply)
 
         current_chat["messages"].append({"role": "assistant", "content": assistant_reply})
-        st.rerun() # Rerun to display the newly added messages
+        st.rerun()
 else:
-    st.info("A chat session is being set up automatically, or you can select an existing one from the sidebar if available.")
+    st.info("Welcome! Start a conversation or click 'New Chat' to begin.")
