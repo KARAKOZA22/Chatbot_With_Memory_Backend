@@ -40,17 +40,6 @@ A sophisticated chatbot application built with Streamlit that maintains persiste
 3. **Chutes.ai API Key**: For fallback AI responses
    - Register at [Chutes.ai](https://chutes.ai/)
 
-### Required Python Packages
-
-```txt
-streamlit
-qdrant-client
-sentence-transformers
-groq
-aiohttp
-nest-asyncio
-```
-
 ## Installation
 
 ### Local Development
