@@ -38,7 +38,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 st.set_page_config(page_title="Chatbot That Can Remember", layout="wide")
-st.title("CRAYON CHATBOT")
+st.title("THE CHATBOT THAT ALWAYS REMEMBER")
 
 # --- NotebookMemoryStore Class (Backend Logic) ---
 class NotebookMemoryStore:
@@ -403,3 +403,4 @@ if prompt := st.chat_input("Type your message..."):
 
     # No need to rerun here as we manually update the UI within the loop
     # st.rerun() # This would cause an unnecessary double-refresh
+
